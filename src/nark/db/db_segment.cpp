@@ -1,4 +1,5 @@
 #include "db_table.hpp"
+#include "db_segment.hpp"
 #include "intkey_index.hpp"
 #include "zip_int_store.hpp"
 #include "fixed_len_key_index.hpp"
@@ -11,7 +12,6 @@
 #include <nark/fsa/fsa.hpp>
 #include <nark/lcast.hpp>
 #include <nark/util/mmap.hpp>
-#include <nark/util/linebuf.hpp>
 #include <nark/util/sortable_strvec.hpp>
 
 #define NARK_DB_ENABLE_DFA_META
@@ -19,314 +19,17 @@
 #include <nark/fsa/nest_trie_dawg.hpp>
 #endif
 
+#if defined(_MSC_VER)
+	#include <io.h>
+#endif
+#include <fcntl.h>
+#include <float.h>
+
 #include "json.hpp"
 
 namespace nark { namespace db {
 
 namespace fs = boost::filesystem;
-
-const llong DEFAULT_readonlyDataMemSize = 2LL * 1024 * 1024 * 1024;
-const llong DEFAULT_maxWrSegSize        = 3LL * 1024 * 1024 * 1024;
-
-SegmentSchema::SegmentSchema() {
-	m_readonlyDataMemSize = DEFAULT_readonlyDataMemSize;
-	m_maxWrSegSize = DEFAULT_maxWrSegSize;
-}
-SegmentSchema::~SegmentSchema() {
-}
-
-void SegmentSchema::compileSchema() {
-	m_indexSchemaSet->compileSchemaSet(m_rowSchema.get());
-	febitvec hasIndex(m_rowSchema->columnNum(), false);
-	for (size_t i = 0; i < m_indexSchemaSet->m_nested.end_i(); ++i) {
-		const Schema& schema = *m_indexSchemaSet->m_nested.elem_at(i);
-		const size_t colnum = schema.columnNum();
-		for (size_t j = 0; j < colnum; ++j) {
-			hasIndex.set1(schema.parentColumnId(j));
-		}
-	}
-
-	// remove columns in colgroups which is also in indices
-	valvec<SchemaPtr> colgroups(m_colgroupSchemaSet->m_nested.end_i());
-	for (size_t i = 0; i < m_colgroupSchemaSet->m_nested.end_i(); ++i) {
-		colgroups[i] = m_colgroupSchemaSet->m_nested.elem_at(i);
-	}
-	m_colgroupSchemaSet->m_nested.erase_all();
-	for (size_t i = 0; i < colgroups.size(); ++i) {
-		SchemaPtr& schema = colgroups[i];
-		schema->m_columnsMeta.shrink_after_erase_if_kv(
-			[&](fstring colname, const ColumnMeta&) {
-			size_t pos = m_rowSchema->m_columnsMeta.find_i(colname);
-			assert(pos < m_rowSchema->m_columnsMeta.end_i());
-			bool ret = hasIndex[pos];
-			hasIndex.set1(pos); // now it is column stored
-			return ret;
-		});
-	}
-	m_colgroupSchemaSet->m_nested = m_indexSchemaSet->m_nested;
-	for (size_t i = 0; i < colgroups.size(); ++i) {
-		SchemaPtr& schema = colgroups[i];
-		if (!schema->m_columnsMeta.empty())
-			m_colgroupSchemaSet->m_nested.insert_i(schema);
-	}
-	m_colgroupSchemaSet->compileSchemaSet(m_rowSchema.get());
-
-	SchemaPtr restAll(new Schema());
-	for (size_t i = 0; i < hasIndex.size(); ++i) {
-		if (!hasIndex[i]) {
-			fstring    colname = m_rowSchema->getColumnName(i);
-			ColumnMeta colmeta = m_rowSchema->getColumnMeta(i);
-			restAll->m_columnsMeta.insert_i(colname, colmeta);
-		}
-	}
-	if (restAll->columnNum() > 0) {
-		restAll->m_name = ".RestAll";
-		restAll->compile(m_rowSchema.get());
-		restAll->m_keepCols.fill(true);
-		m_colgroupSchemaSet->m_nested.insert_i(restAll);
-	}
-}
-
-void SegmentSchema::loadJsonFile(fstring fname) {
-	LineBuf alljson;
-	alljson.read_all(fname.c_str());
-	loadJsonString(alljson);
-}
-
-void SegmentSchema::loadJsonString(fstring jstr) {
-	using nark::json;
-	const json meta = json::parse(jstr.p
-					// UTF8 BOM Check, fixed in nlohmann::json
-					// + (fstring(alljson.p, 3) == "\xEF\xBB\xBF" ? 3 : 0)
-					);
-	const json& rowSchema = meta["RowSchema"];
-	const json& cols = rowSchema["columns"];
-	m_rowSchema.reset(new Schema());
-	m_colgroupSchemaSet.reset(new SchemaSet());
-	for (auto iter = cols.cbegin(); iter != cols.cend(); ++iter) {
-		const auto& col = iter.value();
-		std::string name = iter.key();
-		std::string type = col["type"];
-		std::transform(type.begin(), type.end(), type.begin(), &::tolower);
-		if ("nested" == type) {
-			fprintf(stderr, "TODO: nested column: %s is not supported now, save it to $$\n", name.c_str());
-			continue;
-		}
-		ColumnMeta colmeta;
-		colmeta.type = Schema::parseColumnType(type);
-		if (ColumnType::Fixed == colmeta.type) {
-			colmeta.fixedLen = col["length"];
-		}
-		auto found = col.find("uType");
-		if (col.end() != found) {
-			int uType = found.value();
-			colmeta.uType = byte(uType);
-		}
-		found = col.find("colstore");
-		if (col.end() != found) {
-			bool colstore = found.value();
-			if (colstore) {
-				// this colstore has the only-one 'name' field
-				SchemaPtr schema(new Schema());
-				schema->m_columnsMeta.insert_i(name, colmeta);
-				schema->m_name = name;
-				m_colgroupSchemaSet->m_nested.insert_i(schema);
-			}
-		}
-		auto ib = m_rowSchema->m_columnsMeta.insert_i(name, colmeta);
-		if (!ib.second) {
-			THROW_STD(invalid_argument, "duplicate RowName=%s", name.c_str());
-		}
-	}
-	m_rowSchema->compile();
-	auto iter = meta.find("ReadonlyDataMemSize");
-	if (meta.end() == iter) {
-		m_readonlyDataMemSize = DEFAULT_readonlyDataMemSize;
-	} else {
-		m_readonlyDataMemSize = *iter;
-	}
-	iter = meta.find("MaxWrSegSize");
-	if (meta.end() == iter) {
-		m_maxWrSegSize = DEFAULT_maxWrSegSize;
-	} else {
-		m_maxWrSegSize = *iter;
-	}
-	const json& tableIndex = meta["TableIndex"];
-	if (!tableIndex.is_array()) {
-		THROW_STD(invalid_argument, "json TableIndex must be an array");
-	}
-	m_indexSchemaSet.reset(new SchemaSet());
-	for (const auto& index : tableIndex) {
-		SchemaPtr indexSchema(new Schema());
-		const std::string& strFields = index["fields"];
-		indexSchema->m_name = strFields;
-		std::vector<std::string> fields;
-		fstring(strFields).split(',', &fields);
-		if (fields.size() > Schema::MaxProjColumns) {
-			THROW_STD(invalid_argument, "Index Columns=%zd exceeds Max=%zd",
-				fields.size(), Schema::MaxProjColumns);
-		}
-		for (const std::string& colname : fields) {
-			const size_t k = m_rowSchema->getColumnId(colname);
-			if (k == m_rowSchema->columnNum()) {
-				THROW_STD(invalid_argument,
-					"colname=%s is not in RowSchema", colname.c_str());
-			}
-			indexSchema->m_columnsMeta.
-				insert_i(colname, m_rowSchema->getColumnMeta(k));
-		}
-		auto ib = m_indexSchemaSet->m_nested.insert_i(indexSchema);
-		if (!ib.second) {
-			THROW_STD(invalid_argument,
-				"duplicate index: %s", strFields.c_str());
-		}
-		auto found = index.find("ordered");
-		if (index.end() == found)
-			indexSchema->m_isOrdered = true; // default
-		else
-			indexSchema->m_isOrdered = found.value();
-
-		found = index.find("unique");
-		if (index.end() == found)
-			indexSchema->m_isUnique = false; // default
-		else
-			indexSchema->m_isUnique = found.value();
-	}
-	compileSchema();
-}
-
-void SegmentSchema::saveJsonFile(fstring jsonFile) const {
-	abort(); // not completed yet
-	using nark::json;
-	json meta;
-	json& rowSchema = meta["RowSchema"];
-	json& cols = rowSchema["columns"];
-	cols = json::array();
-	for (size_t i = 0; i < m_rowSchema->columnNum(); ++i) {
-		ColumnType coltype = m_rowSchema->getColumnType(i);
-		std::string colname = m_rowSchema->getColumnName(i).str();
-		std::string strtype = Schema::columnTypeStr(coltype);
-		json col;
-		col["name"] = colname;
-		col["type"] = strtype;
-		if (ColumnType::Fixed == coltype) {
-			col["length"] = m_rowSchema->getColumnMeta(i).fixedLen;
-		}
-		cols.push_back(col);
-	}
-	json& indexSet = meta["TableIndex"];
-	for (size_t i = 0; i < m_indexSchemaSet->m_nested.end_i(); ++i) {
-		const Schema& schema = *m_indexSchemaSet->m_nested.elem_at(i);
-		json indexCols;
-		for (size_t j = 0; j < schema.columnNum(); ++j) {
-			indexCols.push_back(schema.getColumnName(j).str());
-		}
-		indexSet.push_back(indexCols);
-	}
-	std::string jsonStr = meta.dump(2);
-	FileStream fp(jsonFile.c_str(), "w");
-	fp.ensureWrite(jsonStr.data(), jsonStr.size());
-}
-
-#if defined(NARK_DB_ENABLE_DFA_META)
-void SegmentSchema::loadMetaDFA(fstring metaFile) {
-	std::unique_ptr<MatchingDFA> metaConf(MatchingDFA::load_from(metaFile));
-	std::string val;
-	size_t segNum = 0, minWrSeg = 0;
-	(void)segNum;
-	(void)minWrSeg;
-	if (metaConf->find_key_uniq_val("TotalSegNum", &val)) {
-		segNum = lcast(val);
-	} else {
-		THROW_STD(invalid_argument, "metaconf dfa: TotalSegNum is missing");
-	}
-	if (metaConf->find_key_uniq_val("MinWrSeg", &val)) {
-		minWrSeg = lcast(val);
-	} else {
-		THROW_STD(invalid_argument, "metaconf dfa: MinWrSeg is missing");
-	}
-	if (metaConf->find_key_uniq_val("MaxWrSegSize", &val)) {
-		m_maxWrSegSize = lcast(val);
-	} else {
-		m_maxWrSegSize = DEFAULT_maxWrSegSize;
-	}
-	if (metaConf->find_key_uniq_val("ReadonlyDataMemSize", &val)) {
-		m_readonlyDataMemSize = lcast(val);
-	} else {
-		m_readonlyDataMemSize = DEFAULT_readonlyDataMemSize;
-	}
-
-	valvec<fstring> F;
-	MatchContext ctx;
-	m_rowSchema.reset(new Schema());
-	if (!metaConf->step_key_l(ctx, "RowSchema")) {
-		THROW_STD(invalid_argument, "metaconf dfa: RowSchema is missing");
-	}
-	metaConf->for_each_value(ctx, [&](size_t klen, size_t, fstring val) {
-		val.split('\t', &F);
-		if (F.size() < 3) {
-			THROW_STD(invalid_argument, "RowSchema Column definition error");
-		}
-		size_t     columnId = lcast(F[0]);
-		fstring    colname = F[1];
-		ColumnMeta colmeta;
-		colmeta.type = Schema::parseColumnType(F[2]);
-		if (ColumnType::Fixed == colmeta.type) {
-			colmeta.fixedLen = lcast(F[3]);
-		}
-		auto ib = m_rowSchema->m_columnsMeta.insert_i(colname, colmeta);
-		if (!ib.second) {
-			THROW_STD(invalid_argument, "duplicate column name: %.*s",
-				colname.ilen(), colname.data());
-		}
-		if (ib.first != columnId) {
-			THROW_STD(invalid_argument, "bad columnId: %lld", llong(columnId));
-		}
-	});
-	ctx.reset();
-	if (!metaConf->step_key_l(ctx, "TableIndex")) {
-		THROW_STD(invalid_argument, "metaconf dfa: TableIndex is missing");
-	}
-	metaConf->for_each_value(ctx, [&](size_t klen, size_t, fstring val) {
-		val.split(',', &F);
-		if (F.size() < 1) {
-			THROW_STD(invalid_argument, "TableIndex definition error");
-		}
-		SchemaPtr schema(new Schema());
-		for (size_t i = 0; i < F.size(); ++i) {
-			fstring colname = F[i];
-			size_t colId = m_rowSchema->getColumnId(colname);
-			if (colId >= m_rowSchema->columnNum()) {
-				THROW_STD(invalid_argument,
-					"index column name=%.*s is not found in RowSchema",
-					colname.ilen(), colname.c_str());
-			}
-			ColumnMeta colmeta = m_rowSchema->getColumnMeta(colId);
-			schema->m_columnsMeta.insert_i(colname, colmeta);
-		}
-		auto ib = m_indexSchemaSet->m_nested.insert_i(schema);
-		if (!ib.second) {
-			THROW_STD(invalid_argument, "invalid index schema");
-		}
-	});
-	compileSchema();
-}
-
-void SegmentSchema::saveMetaDFA(fstring fname) const {
-	SortableStrVec meta;
-	AutoGrownMemIO buf;
-	size_t pos;
-//	pos = buf.printf("TotalSegNum\t%ld", long(m_segments.s));
-	pos = buf.printf("RowSchema\t");
-	for (size_t i = 0; i < m_rowSchema->columnNum(); ++i) {
-		buf.printf("%04ld", long(i));
-		meta.push_back(fstring(buf.begin(), buf.tell()));
-		buf.seek(pos);
-	}
-	NestLoudsTrieDAWG_SE_512 trie;
-}
-#endif
-
 /////////////////////////////////////////////////////////////////////////////
 
 MultiPartStore::MultiPartStore(valvec<ReadableStorePtr>& parts) {
@@ -356,7 +59,7 @@ const {
 	if (id >= maxId) {
 		THROW_STD(out_of_range, "id %lld, maxId = %lld", id, maxId);
 	}
-	size_t upp = upper_bound_a(m_rowNumVec, id);
+	size_t upp = upper_bound_a(m_rowNumVec, uint32_t(id));
 	assert(upp < m_rowNumVec.size());
 	llong baseId = m_rowNumVec[upp-1];
 	m_parts[upp-1]->getValueAppend(id - baseId, val, ctx);
@@ -482,10 +185,10 @@ void MultiPartStore::syncRowNumVec() {
 	m_rowNumVec.resize_no_init(m_parts.size() + 1);
 	llong rows = 0;
 	for (size_t i = 0; i < m_parts.size(); ++i) {
-		m_rowNumVec[i] = rows;
+		m_rowNumVec[i] = uint32_t(rows);
 		rows += m_parts[i]->numDataRows();
 	}
-	m_rowNumVec.back() = rows;
+	m_rowNumVec.back() = uint32_t(rows);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -494,7 +197,7 @@ ReadableSegment::ReadableSegment() {
 	m_delcnt = 0;
 	m_tobeDel = false;
 	m_isDirty = false;
-	m_isBusyForRemove = false;
+	m_bookDeletion = false;
 }
 ReadableSegment::~ReadableSegment() {
 	if (m_isDelMmap) {
@@ -505,9 +208,19 @@ ReadableSegment::~ReadableSegment() {
 	else if (m_isDirty && !m_tobeDel && !m_segDir.empty()) {
 		saveIsDel(m_segDir);
 	}
+	m_indices.clear(); // destroy index objects
 	assert(!m_segDir.empty());
 	if (m_tobeDel && !m_segDir.empty()) {
-		boost::filesystem::remove_all(m_segDir);
+		fprintf(stderr, "INFO: remove: %s\n", m_segDir.string().c_str());
+		try { boost::filesystem::remove_all(m_segDir); }
+		catch (const std::exception& ex) {
+			fprintf(stderr
+				, "ERROR: ReadableSegment::~ReadableSegment(): ex.what = %s\n"
+				, ex.what());
+		// windows can not delete a hardlink when another hardlink
+		// to the same file is in use
+		//	FEBIRD_IF_DEBUG(abort(),;);
+		}
 	}
 }
 
@@ -558,18 +271,9 @@ byte* ReadableSegment::loadIsDel_aux(PathRef segDir, febitvec& isDel) const {
 	byte* isDelMmap = (byte*)mmap_load(fpath, &bytes, writable);
 	uint64_t rowNum = ((uint64_t*)isDelMmap)[0];
 	isDel.risk_mmap_from(isDelMmap + 8, bytes - 8);
-	assert(m_isDel.size() >= rowNum);
+	assert(isDel.size() >= rowNum);
 	isDel.risk_set_size(size_t(rowNum));
 	return isDelMmap;
-}
-
-void ReadableSegment::unmapIsDel() {
-	febitvec isDel(m_isDel);
-	size_t bitBytes = m_isDel.capacity()/8;
-	mmap_close(m_isDelMmap, sizeof(uint64_t) + bitBytes);
-	m_isDel.risk_release_ownership();
-	m_isDel.swap(isDel);
-	m_isDelMmap = nullptr;
 }
 
 void ReadableSegment::openIndices(PathRef segDir) {
@@ -623,9 +327,9 @@ void ReadableSegment::save(PathRef segDir) const {
 ReadonlySegment::ReadonlySegment() {
 	m_dataMemSize = 0;
 	m_totalStorageSize = 0;
-	m_maxPartDataSize = 2LL * 1024*1024*1024;
 }
 ReadonlySegment::~ReadonlySegment() {
+	m_colgroups.clear();
 }
 
 llong ReadonlySegment::dataStorageSize() const {
@@ -756,6 +460,8 @@ const {
 	auto cp = m_schema->m_colproject[columnId];
 	size_t colgroupId = cp.colgroupId;
 	const Schema& schema = m_schema->getColgroupSchema(colgroupId);
+//	printf("colprojects = %zd, colgroupId = %zd, schema.cols = %zd\n"
+//		, m_schema->m_colproject.size(), colgroupId, schema.columnNum());
 	if (schema.columnNum() == 1) {
 		m_colgroups[colgroupId]->getValue(recId, colsData, ctx);
 	}
@@ -831,18 +537,22 @@ StoreIterator* ReadonlySegment::createStoreIterBackward(DbContext* ctx) const {
 
 void
 ReadonlySegment::mergeFrom(const valvec<const ReadonlySegment*>& input, DbContext* ctx) {
-	m_indices.resize(input[0]->m_indices.size());
+	const size_t indexNum = m_schema->getIndexNum();
+	const size_t colgroupNum = m_schema->getColgroupNum();
+	m_indices.resize(indexNum);
+	m_colgroups.resize(colgroupNum);
 	valvec<byte> buf;
-	SortableStrVec strVec;
 	for (size_t i = 0; i < m_indices.size(); ++i) {
+		SortableStrVec strVec;
 		const Schema& indexSchema = m_schema->getIndexSchema(i);
 		size_t fixedIndexRowLen = indexSchema.getFixedRowLen();
 		for (size_t j = 0; j < input.size(); ++j) {
 			auto seg = input[j];
 			auto indexStore = seg->m_indices[i]->getReadableStore();
-			llong num = indexStore->numDataRows();
-			for (llong id = 0; id < num; ++id) {
-				if (!seg->m_isDel[id]) {
+			assert(nullptr != indexStore);
+			llong rows = seg->numDataRows();
+			for (llong id = 0; id < rows; ++id) {
+				if (!seg->m_isDel[size_t(id)]) {
 					indexStore->getValue(id, &buf, ctx);
 					if (fixedIndexRowLen) {
 						assert(buf.size() == fixedIndexRowLen);
@@ -852,22 +562,33 @@ ReadonlySegment::mergeFrom(const valvec<const ReadonlySegment*>& input, DbContex
 				}
 			}
 		}
-		m_indices[i] = this->buildIndex(indexSchema, strVec);
-		strVec.clear();
+		ReadableIndex* index = this->buildIndex(indexSchema, strVec);
+		m_indices[i] = index;
+		m_colgroups[i] = index->getReadableStore();
+	}
+
+	for (size_t i = indexNum; i < colgroupNum; ++i) {
+
 	}
 }
 
 namespace {
-	class FileDataIO {
+	class FileDataIO : public ReadableStore {
+		class FileStoreIter;
 		FileStream m_fp;
 		NativeDataOutput<OutputBuffer> m_obuf;
 		size_t m_fixedLen;
+		size_t m_fileSize;
+		size_t m_rows;
 		FileDataIO(const FileDataIO&) = delete;
 	public:
 		FileDataIO(size_t fixedLen) {
+			intrusive_ptr_add_ref(this); // Trick: will never be deleted
 			m_fp.attach(tmpfile());
 			m_obuf.attach(&m_fp);
 			m_fixedLen = fixedLen;
+			m_fileSize = 0;
+			m_rows = 0;
 		}
 		void dioWrite(const valvec<byte>& rowData) {
 		//	assert(rowData.size() > 0); // can be empty
@@ -880,16 +601,19 @@ namespace {
 						, rowData.size(), m_fixedLen);
 			}
 			m_obuf.ensureWrite(rowData.data(), rowData.size());
+			m_rows++;
 		}
 		void completeWrite() {
 			m_obuf.flush();
 			m_fp.rewind();
+			m_fileSize = m_fp.size();
 		}
 		FileStream& fp() { return m_fp; }
 		size_t fixedLen() const { return m_fixedLen; }
 
 		void prepairRead(NativeDataInput<InputBuffer>& dio) {
 			m_fp.disbuf();
+			m_fp.rewind();
 			dio.resetbuf();
 			dio.attach(&m_fp);
 		}
@@ -917,7 +641,68 @@ namespace {
 				return newRowNum;
 			}
 		}
+
+		llong dataStorageSize() const override { return m_fileSize; }
+		llong numDataRows() const override { return m_rows; }
+
+		double avgLen() const { return (m_fileSize + 0.1) / (m_rows + 0.1); }
+
+		StoreIterator* createStoreIterForward(DbContext*) const override;
+		StoreIterator* createStoreIterBackward(DbContext*) const override {
+			THROW_STD(invalid_argument, "Not Implemented");
+			return NULL;
+		}
+		void getValueAppend(llong, valvec<byte>*, DbContext*) const override {
+			THROW_STD(invalid_argument, "Not Implemented");
+		}
+		void save(PathRef) const {
+			THROW_STD(invalid_argument, "Not Implemented");
+		}
+		void load(PathRef) {
+			THROW_STD(invalid_argument, "Not Implemented");
+		}
 	};
+
+	class FileDataIO::FileStoreIter : public StoreIterator {
+		NativeDataInput<InputBuffer> m_ibuf;
+		llong m_id;
+		llong m_rows;
+		size_t m_fixedLen;
+	public:
+		explicit FileStoreIter(FileDataIO* store) {
+			m_store.reset(store);
+			store->prepairRead(m_ibuf);
+			m_id = 0;
+			m_rows = store->numDataRows();
+			m_fixedLen = store->fixedLen();
+		}
+		bool increment(llong* id, valvec<byte>* val) override {
+			if (m_id < m_rows) {
+				if (m_fixedLen) {
+					val->resize_no_init(m_fixedLen);
+					m_ibuf.ensureRead(val->data(), m_fixedLen);
+				}
+				else {
+					m_ibuf >> *val;
+				}
+				*id = m_id++;
+				return true;
+			}
+			return false;
+		}
+		bool seekExact(llong  id, valvec<byte>* val) override {
+			THROW_STD(invalid_argument, "Not Implemented");
+			return false;
+		}
+		void reset() override {
+			dynamic_cast<FileDataIO*>(m_store.get())->prepairRead(m_ibuf);
+			m_id = 0;
+		}
+	};
+
+	StoreIterator* FileDataIO::createStoreIterForward(DbContext*) const {
+		return new FileStoreIter(const_cast<FileDataIO*>(this));
+	}	
 
 	class TempFileList : public valvec<FileDataIO> {
 		const SchemaSet& m_schemaSet;
@@ -946,37 +731,54 @@ namespace {
 	};
 }
 
+ReadableStore*
+ReadonlySegment::buildDictZipStore(const Schema&, StoreIterator& inputIter) const {
+	THROW_STD(invalid_argument,
+		"Not Implemented, Only Implemented by DfaDbReadonlySegment");
+}
+
 void
-ReadonlySegment::convFrom(const ReadableSegment& input, DbContext* ctx)
+ReadonlySegment::convFrom(CompositeTable* tab, size_t segIdx)
 {
-	assert(input.numDataRows() > 0);
+	DbContextPtr ctx(tab->createDbContext());
+	ReadableSegmentPtr input;
+	{
+		MyRwLock lock(tab->m_rwMutex, false);
+		input = tab->m_segments[segIdx];
+		m_isDel = input->m_isDel; // make a copy, input->m_isDel[*] may be changed
+		m_delcnt = input->m_delcnt;
+	}
+	llong savedInputRowNum = input->m_isDel.size();
+	assert(savedInputRowNum > 0);
 	size_t indexNum = m_schema->getIndexNum();
 	TempFileList colgroupTempFiles(*m_schema->m_colgroupSchemaSet);
 
 	valvec<fstring> columns(m_schema->columnNum(), valvec_reserve());
 	valvec<byte> buf, projRowBuf;
 	SortableStrVec strVec;
-	llong inputRowNum = input.numDataRows();
-	assert(size_t(inputRowNum) == input.m_isDel.size());
-	StoreIteratorPtr iter(input.createStoreIterForward(ctx));
+	llong inputRowNum = 0;
+	StoreIteratorPtr iter(input->createStoreIterForward(ctx.get()));
 	llong id = -1;
 	llong newRowNum = 0;
-	{
-		MyRwLock lock(ctx->m_tab->m_rwMutex, false);
-		m_isDel = input.m_isDel; // make a copy, input.m_isDel[*] may be changed
-		m_delcnt = input.m_delcnt;
-	}
 	while (iter->increment(&id, &buf)) {
+		inputRowNum++;
 		assert(id >= 0);
-		assert(id < inputRowNum);
+		assert(id < savedInputRowNum);
 		if (m_isDel[id]) continue;
 
 		m_schema->m_rowSchema->parseRow(buf, &columns);
 		colgroupTempFiles.writeColgroups(columns, projRowBuf);
 		newRowNum++;
 	}
+	if (inputRowNum < savedInputRowNum) {
+		fprintf(stderr
+			, "WARN: inputRows[real=%lld saved=%lld], some data have lossed\n"
+			, inputRowNum, savedInputRowNum);
+		input->m_isDel.risk_set_size(inputRowNum);
+		this->m_isDel.risk_set_size(inputRowNum);
+	}
 	assert(newRowNum <= inputRowNum);
-	assert(inputRowNum - newRowNum == m_delcnt);
+	assert(size_t(inputRowNum - newRowNum) == m_delcnt);
 
 	// build index from temporary index files
 	colgroupTempFiles.completeWrite();
@@ -988,11 +790,25 @@ ReadonlySegment::convFrom(const ReadableSegment& input, DbContext* ctx)
 		colgroupTempFiles[i].prepairRead(dio);
 		colgroupTempFiles[i].collectData(dio, newRowNum, strVec);
 		m_indices[i] = this->buildIndex(schema, strVec);
-		m_colgroups[i] = const_cast<ReadableStore*>(m_indices[i]->getReadableStore());
+		m_colgroups[i] = m_indices[i]->getReadableStore();
 		strVec.clear();
 	}
 	for (size_t i = indexNum; i < colgroupTempFiles.size(); ++i) {
 		const Schema& schema = m_schema->getColgroupSchema(i);
+		// dictZipLocalMatch is true by default
+		// dictZipLocalMatch == false is just for experiment
+		// dictZipLocalMatch should always be true in production
+		// dictZipSampleRatio < 0 indicate don't use dictZip
+		if (schema.m_dictZipLocalMatch && schema.m_dictZipSampleRatio >= 0.0) {
+			double sRatio = schema.m_dictZipSampleRatio;
+			double avgLen = colgroupTempFiles[i].avgLen();
+			if (sRatio > 0 || (sRatio < FLT_EPSILON && avgLen > 100)) {
+				StoreIteratorPtr
+				iter = colgroupTempFiles[i].createStoreIterForward(NULL);
+				m_colgroups[i] = this->buildDictZipStore(schema, *iter);
+				continue;
+			}
+		}
 		size_t maxMem = m_schema->m_readonlyDataMemSize;
 		llong rows = 0;
 		valvec<ReadableStorePtr> parts;
@@ -1005,20 +821,33 @@ ReadonlySegment::convFrom(const ReadableSegment& input, DbContext* ctx)
 		}
 		m_colgroups[i] = parts.size()==1 ? parts[0] : new MultiPartStore(parts);
 	}
+	m_dataMemSize = 0;
+	for (size_t i = 0; i < m_colgroups.size(); ++i) {
+		m_dataMemSize += m_colgroups[i]->dataStorageSize();
+	}
 
+	auto tmpDir = m_segDir + ".tmp";
+	fs::create_directories(tmpDir);
+	this->save(tmpDir);
+
+	// reload as mmap
+	m_isDel.clear();
+	m_indices.erase_all();
+	m_colgroups.erase_all();
+	this->load(tmpDir);
 	{
-		MyRwLock lock(ctx->m_tab->m_rwMutex, false);
-		if (m_delcnt < input.m_delcnt) { // rows were deleted during build
+		MyRwLock lock(tab->m_rwMutex, false);
+		if (m_delcnt < input->m_delcnt) { // rows were deleted during build
 			size_t i = 0;
 			for (size_t j = 0; j < size_t(inputRowNum); ++j) {
 				if (!m_isDel[j])
-					 m_isDel.set(i, input.m_isDel[j]), ++i;
+					 m_isDel.set(i, input->m_isDel[j]), ++i;
 			}
 			assert(i == size_t(newRowNum));
-			size_t new_delcnt = input.m_delcnt - m_delcnt;
+			size_t new_delcnt = input->m_delcnt - m_delcnt;
 			fprintf(stderr,
 				"INFO: ReadonlySegment::convFrom: delcnt[old=%zd input2=%zd new=%zd] done\n",
-				m_delcnt, input.m_delcnt, new_delcnt);
+				m_delcnt, input->m_delcnt, new_delcnt);
 			m_isDel.risk_set_size(size_t(newRowNum));
 			m_delcnt = new_delcnt;
 			assert(m_isDel.popcnt() == m_delcnt);
@@ -1027,26 +856,11 @@ ReadonlySegment::convFrom(const ReadableSegment& input, DbContext* ctx)
 			m_isDel.resize_fill(size_t(newRowNum), false);
 			m_delcnt = 0;
 		}
-		input.m_isBusyForRemove = true;
+		((uint64_t*)m_isDelMmap)[0] = newRowNum;
+		tab->m_segments[segIdx] = this;
 	}
-
-	{
-		auto tmpDir = m_segDir + ".tmp";
-		fs::create_directories(tmpDir);
-		this->save(tmpDir);
-		fs::rename(tmpDir, m_segDir);
-	}
-
-// reload as mmap
-	m_isDel.clear();
-	m_indices.erase_all();
-	m_colgroups.erase_all();
-	this->load(m_segDir);
-
-	m_dataMemSize = 0;
-	for (size_t i = 0; i < m_colgroups.size(); ++i) {
-		m_dataMemSize += m_colgroups[i]->dataStorageSize();
-	}
+	fs::rename(tmpDir, m_segDir);
+	input->deleteSegment();
 }
 
 void ReadonlySegment::saveRecordStore(PathRef segDir) const {
@@ -1073,17 +887,20 @@ void ReadonlySegment::loadRecordStore(PathRef segDir) {
 		assert(m_indices[i]); // index must have be loaded
 		auto store = m_indices[i]->getReadableStore();
 		assert(nullptr != store);
-		m_colgroups[i] = const_cast<ReadableStore*>(store);
+		m_colgroups[i] = store;
 	}
 	SortableStrVec files;
 	for(auto ent : fs::directory_iterator(segDir)) {
-		files.push_back(ent.path().filename().string());
+		std::string  fname = ent.path().filename().string();
+		if (!fstring(fname).endsWith("-dict")) {
+			files.push_back(fname);
+		}
 	}
 	files.sort();
 	for (size_t i = indexNum; i < colgroupNum; ++i) {
 		const Schema& schema = m_schema->getColgroupSchema(i);
 		std::string prefix = "colgroup-" + schema.m_name;
-		size_t lo = lower_bound_0<SortableStrVec&>(files, files.size(), prefix);
+		size_t lo = files.lower_bound(prefix);
 		if (lo >= files.size() || !files[lo].startsWith(prefix)) {
 			THROW_STD(invalid_argument, "missing: %s",
 				(segDir / prefix).string().c_str());
@@ -1179,6 +996,56 @@ WritableSegment::WritableSegment() {
 WritableSegment::~WritableSegment() {
 	if (!m_tobeDel)
 		flushSegment();
+}
+
+void WritableSegment::pushIsDel(bool val) {
+	const size_t ChunkBits = FEBIRD_IF_DEBUG(4*1024, 1*1024*1024);
+	if (nark_unlikely(nullptr == m_isDelMmap)) {
+		assert(m_isDel.size() == 0);
+		assert(m_isDel.capacity() == 0);
+		m_isDel.resize_fill(ChunkBits - 64, 0); // 64 is for uint64 header
+		saveIsDel(m_segDir);
+		m_isDel.clear();
+		m_isDelMmap = loadIsDel_aux(m_segDir, m_isDel);
+		((uint64_t*)m_isDelMmap)[0] = 0;
+		m_isDel.risk_set_size(0);
+		m_delcnt = 0;
+	}
+	else if (nark_unlikely(m_isDel.size() == m_isDel.capacity())) {
+		assert((64 + m_isDel.size()) % ChunkBits == 0);
+		size_t newCap = ((64+m_isDel.size()+2*ChunkBits-1) & ~(ChunkBits-1));
+		mmap_close(m_isDelMmap, sizeof(uint64_t) + m_isDel.mem_size());
+		m_isDelMmap = nullptr;
+		m_isDel.risk_release_ownership();
+		std::string fpath = (m_segDir / "isDel").string();
+#ifdef _MSC_VER
+	{
+		Auto_close_fd fd(::_open(fpath.c_str(), O_CREAT|O_BINARY|O_RDWR));
+		if (fd < 0) {
+			THROW_STD(logic_error
+				, "FATAL: ::_open(%s, O_CREAT|O_BINARY|O_RDWR) = %s"
+				, fpath.c_str(), strerror(errno));
+		}
+		int err = ::_chsize_s(fd, newCap/8);
+		if (err) {
+			THROW_STD(logic_error, "FATAL: ::_chsize_s(%s, %zd) = %s"
+				, fpath.c_str(), newCap/8, strerror(errno));
+		}
+	}
+#else
+		int err = ::truncate(fpath.c_str(), newCap/8);
+		if (err) {
+			THROW_STD(logic_error, "FATAL: ::truncate(%s, %zd) = %s"
+				, fpath.c_str(), newCap/8, strerror(errno));
+		}
+#endif
+		m_isDelMmap = loadIsDel_aux(m_segDir, m_isDel);
+		assert(nullptr != m_isDelMmap);
+	}
+	assert(m_isDel.size() < m_isDel.capacity());
+	assert(m_isDel.size() == size_t(((uint64_t*)m_isDelMmap)[0]));
+	m_isDel.unchecked_push_back(val);
+	((uint64_t*)m_isDelMmap)[0] = m_isDel.size();
 }
 
 WritableStore* WritableSegment::getWritableStore() {

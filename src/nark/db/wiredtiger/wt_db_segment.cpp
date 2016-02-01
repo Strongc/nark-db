@@ -2,25 +2,23 @@
 #include "wt_db_index.hpp"
 #include "wt_db_store.hpp"
 #include "wt_db_context.hpp"
-#include <nark/num_to_str.hpp>
 
 namespace nark { namespace db { namespace wt {
 
 WtWritableSegment::WtWritableSegment() {
 	m_wtConn = NULL;
 	m_wrRowStore = NULL;
-	m_cursorIsDel = NULL;
 	m_cacheSize = 1*(1ul << 30); // 1GB
+	if (const char* env = getenv("NarkDb_WrSegCacheSizeMB")) {
+		m_cacheSize = (size_t)strtoull(env, NULL, 10) * 1024 * 1024;
+	}
 }
 WtWritableSegment::~WtWritableSegment() {
-	m_cursorIsDel->close(m_cursorIsDel);
 	m_indices.clear();
 	m_rowStore.reset();
 	if (m_wtConn)
 		m_wtConn->close(m_wtConn, NULL);
 }
-
-static const char g_isDelTable[] = "table:__isDel__";
 
 void WtWritableSegment::init(PathRef segDir) {
 	std::string strDir = segDir.string();
@@ -41,20 +39,6 @@ void WtWritableSegment::init(PathRef segDir) {
 	if (err) {
 		THROW_STD(invalid_argument, "FATAL: wiredtiger open session(dir=%s) = %s"
 			, strDir.c_str(), wiredtiger_strerror(err)
-			);
-	}
-	err = session->create(session, g_isDelTable, "key_format=r,value_format=1t");
-	if (err) {
-		THROW_STD(invalid_argument
-			, "FATAL: wiredtiger create(\"%s\", dir=%s) = %s"
-			, strDir.c_str(), g_isDelTable, wiredtiger_strerror(err)
-			);
-	}
-	err = session->open_cursor(session, g_isDelTable, NULL, NULL, &m_cursorIsDel);
-	if (err) {
-		THROW_STD(invalid_argument
-			, "FATAL: wiredtiger open cursor(\"%s\", dir=%s) = %s"
-			, strDir.c_str(), g_isDelTable, wiredtiger_strerror(err)
 			);
 	}
 	m_rowStore = new WtWritableStore(session, segDir);
@@ -128,17 +112,6 @@ void WtWritableSegment::replace(llong id, fstring row, DbContext* ctx) {
 }
 
 void WtWritableSegment::remove(llong id, DbContext* ctx) {
-	tbb::mutex::scoped_lock lock(m_wtMutex);
-	llong recno = id + 1;
-	m_cursorIsDel->set_key(m_cursorIsDel, recno);
-	m_cursorIsDel->set_value(m_cursorIsDel, 1);
-	int err = m_cursorIsDel->insert(m_cursorIsDel);
-	if (err) {
-		THROW_STD(invalid_argument
-			, "FATAL: wiredtiger mark del(recno=%lld, dir=%s) = %s"
-			, recno, m_wtConn->get_home(m_wtConn), wiredtiger_strerror(err)
-			);
-	}
 	m_wrRowStore->remove(id, ctx);
 }
 
@@ -159,28 +132,25 @@ void WtWritableSegment::load(PathRef path) {
 	init(path);
 	if (boost::filesystem::exists(path / "isDel")) {
 		WritableSegment::load(path);
-		return;
-	}
-
-	this->openIndices(path);
-
-	// rebuild m_isDel
-	llong rows = m_rowStore->numDataRows();
-	m_isDel.resize_fill(size_t(rows), 0);
-	WT_CURSOR* cursor = m_cursorIsDel;
-	cursor->reset(cursor);
-	while (cursor->next(cursor) == 0) {
-		llong recno;
-		int val = 0;
-		cursor->get_key(cursor, &recno);
-		cursor->get_value(cursor, &val);
-		FEBIRD_RT_assert(recno > 0, std::logic_error);
-		if (val) {
-			llong id = recno - 1;
-			m_isDel.set1(size_t(id));
+		size_t rows = (size_t)m_rowStore->numDataRows();
+		if (rows+1 < m_isDel.size() || (rows+1 == m_isDel.size() && !m_isDel[rows])) {
+			fprintf(stderr
+				, "WARN: wiredtiger store: rows[saved=%zd real=%zd], some data may lossed\n"
+				, m_isDel.size(), rows);
+		//	m_isDel.risk_set_size(rows); // don't uncomment, because we must allow m_isDel be larger
+		}
+		else if (rows > m_isDel.size()) {
+			fprintf(stderr
+				, "WARN: wiredtiger store: rows[saved=%zd real=%zd], some error may occurred, ignore it and easy recover\n"
+				, m_isDel.size(), rows);
+			while (m_isDel.size() < rows) {
+				this->pushIsDel(false);
+			}
 		}
 	}
-	cursor->reset(cursor);
+	else {
+		this->openIndices(path);
+	}
 }
 
 }}} // namespace nark::db::wt

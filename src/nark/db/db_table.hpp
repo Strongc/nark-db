@@ -1,13 +1,20 @@
 #ifndef __nark_db_table_store_hpp__
 #define __nark_db_table_store_hpp__
 
-#include "db_segment.hpp"
+#include "data_store.hpp"
+#include "data_index.hpp"
 #include <tbb/queuing_rw_mutex.h>
 
 namespace nark { namespace db {
 
 typedef tbb::queuing_rw_mutex              MyRwMutex;
 typedef tbb::queuing_rw_mutex::scoped_lock MyRwLock;
+
+class NARK_DB_DLL ReadableSegment;
+class NARK_DB_DLL ReadonlySegment;
+class NARK_DB_DLL WritableSegment;
+typedef boost::intrusive_ptr<ReadableSegment> ReadableSegmentPtr;
+typedef boost::intrusive_ptr<WritableSegment> WritableSegmentPtr;
 
 // is not a WritableStore
 class NARK_DB_DLL CompositeTable : public ReadableStore {
@@ -27,7 +34,7 @@ public:
 
 	static CompositeTable* createTable(fstring tableClass);
 
-	virtual void init(PathRef dir, SegmentSchemaPtr);
+	virtual void init(PathRef dir, SchemaConfigPtr);
 
 	void load(PathRef dir) override;
 	void save(PathRef dir) const override;
@@ -96,10 +103,8 @@ public:
 	const;
 #endif
 
-	bool compact();
 	void clear();
 	void flush();
-	void asyncFinishWriting();
 	void syncFinishWriting();
 
 	void dropTable();
@@ -108,10 +113,6 @@ public:
 
 	size_t getSegNum () const { return m_segments.size(); }
 	size_t getWritableSegNum() const;
-	ReadableSegmentPtr getSegment(size_t segIdx) const {
-		assert(segIdx < m_segments.size());
-		return m_segments[segIdx];
-	}
 
 	///@{ internal use only
 	void convWritableSegmentToReadonly(size_t segIdx);
@@ -126,15 +127,20 @@ public:
 protected:
 	static void registerTableClass(fstring tableClass, std::function<CompositeTable*()> tableFactory);
 
+	class MergeParam; friend class MergeParam;
+	void merge(MergeParam&);
+
 	bool maybeCreateNewSegment(MyRwLock&);
+	void doCreateNewSegmentInLock();
 	llong insertRowImpl(fstring row, DbContext*, MyRwLock&);
-	bool insertCheckSegDup(size_t begSeg, size_t endSeg, DbContext*);
+	bool insertCheckSegDup(size_t begSeg, size_t numSeg, DbContext*);
 	bool insertSyncIndex(llong subId, DbContext*);
-	bool replaceCheckSegDup(size_t begSeg, size_t endSeg, DbContext*);
+	bool replaceCheckSegDup(size_t begSeg, size_t numSeg, DbContext*);
 	bool replaceSyncIndex(llong newSubId, DbContext*, MyRwLock&);
 
+	boost::filesystem::path getMergePath(PathRef dir, size_t mergeSeq) const;
 	boost::filesystem::path getSegPath(const char* type, size_t segIdx) const;
-	boost::filesystem::path getSegPath2(PathRef dir, const char* type, size_t segIdx) const;
+	boost::filesystem::path getSegPath2(PathRef dir, size_t mergeSeq, const char* type, size_t segIdx) const;
 
 	virtual ReadonlySegment* createReadonlySegment(PathRef segDir) const = 0;
 	virtual WritableSegment* createWritableSegment(PathRef segDir) const = 0;
@@ -154,14 +160,15 @@ protected:
 	valvec<llong>  m_rowNumVec;
 	valvec<ReadableSegmentPtr> m_segments;
 	WritableSegmentPtr m_wrSeg;
-	llong m_readonlyDataMemSize;
+	size_t m_mergeSeqNum;
+	size_t m_newWrSegNum;
+	size_t m_bgTaskNum;
+	bool m_tobeDrop;
+	bool m_isMerging;
 
 	// constant once constructed
 	boost::filesystem::path m_dir;
-	SegmentSchemaPtr m_schema;
-	valvec<size_t> m_uniqIndices;
-	valvec<size_t> m_multIndices;
-	bool m_tobeDrop;
+	SchemaConfigPtr m_schema;
 	friend class TableIndexIter;
 	friend class TableIndexIterBackward;
 	friend class DbContext;

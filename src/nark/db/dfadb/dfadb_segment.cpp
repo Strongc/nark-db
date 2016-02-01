@@ -43,7 +43,7 @@ const {
 		patchStrVec(indexData, fixlen);
 	}
 	std::unique_ptr<NestLoudsTrieIndex> index(new NestLoudsTrieIndex());
-	index->build(indexData);
+	index->build(schema, indexData);
 	return index.release();
 }
 
@@ -60,8 +60,17 @@ const {
 		assert(fixlen > 0);
 		patchStrVec(storeData, fixlen);
 	}
-	nlt->build(storeData);
+	nlt->build(schema, storeData);
 	return nlt.release();
 }
+
+ReadableStore*
+DfaDbReadonlySegment::buildDictZipStore(const Schema& schema, StoreIterator& inputIter)
+const {
+	std::unique_ptr<NestLoudsTrieStore> nlt(new NestLoudsTrieStore());
+	nlt->build_by_iter(schema, inputIter);
+	return nlt.release();
+}
+
 
 }}} // namespace nark::db::dfadb

@@ -20,12 +20,13 @@ public:
 	StoreIterator* createStoreIterForward(DbContext*) const override;
 	StoreIterator* createStoreIterBackward(DbContext*) const override;
 
-	void build(SortableStrVec& strVec);
+	void build(const Schema&, SortableStrVec& strVec);
+	void build_by_iter(const Schema&, StoreIterator& iter);
 	void load(PathRef path) override;
 	void save(PathRef path) const override;
 
 protected:
-	std::unique_ptr<NestLoudsTrieDataStore_SE_512> m_store;
+	std::unique_ptr<DataStore> m_store;
 };
 
 }}} // namespace nark::db::dfadb

@@ -77,6 +77,10 @@ else
   endif
 endif
 
+ifeq (WITH_BMI2,1)
+	CPU += -mbmi -mbmi2
+endif
+
 COMMON_C_FLAGS  += -Wformat=2 -Wcomment
 COMMON_C_FLAGS  += -Wall -Wextra
 COMMON_C_FLAGS  += -Wno-unused-parameter
@@ -222,6 +226,22 @@ ${NarkDB_d} : $(call objs,NarkDB,d)
 ${NarkDB_r} : $(call objs,NarkDB,r)
 ${static_NarkDB_d} : $(call objs,NarkDB,d)
 ${static_NarkDB_r} : $(call objs,NarkDB,r)
+
+TarBall := pkg/narkdb-${UNAME_MachineSystem}-${COMPILER}
+.PHONY : pkg
+pkg: ${NarkDB_d} ${NarkDB_r}
+	rm -rf ${TarBall}
+	mkdir -p ${TarBall}/lib
+ifeq (${PKG_WITH_DBG},1)
+	cp    ${NarkDB_d} ${TarBall}/lib
+	ln -s libnark-NarkDB-${COMPILER}-d${DLL_SUFFIX} ${TarBall}/lib/libnark-NarkDB-d${DLL_SUFFIX}
+endif
+	cp    ${NarkDB_r} ${TarBall}/lib
+	ln -s libnark-NarkDB-${COMPILER}-r${DLL_SUFFIX} ${TarBall}/lib/libnark-NarkDB-r${DLL_SUFFIX}
+	echo $(shell date "+%Y-%m-%d %H:%M:%S") > ${TarBall}/package.buildtime.txt
+	echo $(shell git log | head -n1) >> ${TarBall}/package.buildtime.txt
+	tar czf ${TarBall}.tgz ${TarBall}
+
 
 %${DLL_SUFFIX}:
 	@echo "----------------------------------------------------------------------------------"

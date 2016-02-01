@@ -25,8 +25,8 @@ public:
 	IndexIterator* createIndexIterForward(DbContext*) const override;
 	IndexIterator* createIndexIterBackward(DbContext*) const override;
 
-	const ReadableIndex* getReadableIndex() const override;
-	const ReadableStore* getReadableStore() const override;
+	ReadableIndex* getReadableIndex() override;
+	ReadableStore* getReadableStore() override;
 
 	llong dataStorageSize() const override;
 	llong numDataRows() const override;
@@ -34,7 +34,7 @@ public:
 	StoreIterator* createStoreIterForward(DbContext*) const override;
 	StoreIterator* createStoreIterBackward(DbContext*) const override;
 
-	void build(SortableStrVec& strVec);
+	void build(const Schema& schema, SortableStrVec& strVec);
 	void load(PathRef path) override;
 	void save(PathRef path) const override;
 

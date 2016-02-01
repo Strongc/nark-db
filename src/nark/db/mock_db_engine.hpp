@@ -2,6 +2,7 @@
 #define __nark_db_mock_data_index_hpp__
 
 #include <nark/db/db_table.hpp>
+#include <nark/db/db_segment.hpp>
 #include <nark/util/fstrvec.hpp>
 #include <set>
 
@@ -56,8 +57,8 @@ public:
 	IndexIterator* createIndexIterBackward(DbContext*) const override;
 	llong indexStorageSize() const override;
 
-	const ReadableIndex* getReadableIndex() const override;
-	const ReadableStore* getReadableStore() const override;
+	ReadableIndex* getReadableIndex() override;
+	ReadableStore* getReadableStore() override;
 };
 typedef boost::intrusive_ptr<MockReadonlyIndex> MockReadonlyIndexPtr;
 
